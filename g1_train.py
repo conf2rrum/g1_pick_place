@@ -7,7 +7,7 @@ import sys
 # [1] AppLauncher: 시뮬레이터 실행 준비
 from isaaclab.app import AppLauncher
 parser = argparse.ArgumentParser(description="Train G1 Robot")
-parser.add_argument("--num_envs", type=int, default=60, help="Number of environments to simulate.")
+parser.add_argument("--num_envs", type=int, default=240, help="Number of environments to simulate.")
 parser.add_argument("--seed", type=int, default=42, help="Seed used for the environment")
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()

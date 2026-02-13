@@ -60,8 +60,50 @@ def reward_pick_and_place(env, robot_cfg: SceneEntityCfg, object_cfg: SceneEntit
     object: RigidObject = env.scene[object_cfg.name]
     goal: RigidObject = env.scene[goal_cfg.name]
 
-    #
+    # 1. 데이터 가져오기
+    ids = robot.find_bodies(hand_body_name)[0][0]
+    hand_pos = robot.data.body_pos_w[:, ids]
+    object_pos = object.data.root_pos_w
+    goal_pos = goal.data.root_pos_w
 
+    # 2. 거리 계산
+    # 손 <-> 물체 거리
+    d_hand_obj = torch.norm(hand_pos - object_pos, dim=1)
+    # 물체 <-> 목표 거리
+    d_obj_goal = torch.norm(object_pos - goal_pos, dim=1)
+
+    # 3. 상태 판단
+    # 물체의 높이가 0.6m 이상이면 "들었다"고 판단
+    is_lifted = object_pos[:, 2] > 0.65
+
+    # 4. 보상 계산 로직
+    # 기본 점수: 손이 물체에 가까이 갈수록 점수
+    reward = 1.0 / (1.0 + d_hand_obj**2)
+
+    # [핵심] 물체를 들어 올렸다면? -> 목표 지점으로 가는 것에 점수를 줌
+    # 들어 올린 상태에서는 손-물체 거리는 이미 가까우니 무시하고, 물체-목표 거리에 집중
+    reward = torch.where(
+        is_lifted,
+        2.0 + (1.0 / (1.0 + d_obj_goal**2)),    # 들었으면 보너스 2점 + 목표 접근 점수
+        reward  # 안들었으면 그냥 접근 점수만
+    )
+
+    return reward
+
+def reward_object_out_of_bounds(env, object_cfg: SceneEntityCfg, x_limits: list, y_limits: list, z_limits: list):
+    object: RigidObject = env.scene[object_cfg.name]
+    pos = object.data.root_pos_w
+
+    # 각 축(x, y, z)별로 범위를 벗어났는지 체크
+    is_out_x = (pos[:, 0] < x_limits[0]) | (pos[:, 0] > x_limits[1])
+    is_out_y = (pos[:, 1] < y_limits[0]) | (pos[:, 1] > y_limits[1])
+    is_out_z = (pos[:, 2] < z_limits[0]) | (pos[:, 2] > z_limits[1])
+
+    is_out = is_out_x | is_out_y | is_out_z
+
+    # 벗어났으면 1.0, 아니면 0.0 반환
+    # (나중에 weight에 -1.0을 곱해서 벌점으로 만듦)
+    return is_out.float()
 
 
 # ------------------------------------------------------------------------------
@@ -84,16 +126,16 @@ class G1PickPlaceSceneCfg(InteractiveSceneCfg):
     # (3) 책상
     table = AssetBaseCfg(
         prim_path="{ENV_REGEX_NS}/Table",
-        # 크기: 가로 1m, 세로 0.6m, 높이 0.5m
+        # 크기: 가로 0.6m, 세로 1m, 높이 0.7m
         spawn=sim_utils.CuboidCfg(
-            size=(1.0, 0.6, 0.5), 
+            size=(0.6, 1, 0.7), 
             visual_material=sim_utils.PreviewSurfaceCfg(
                 diffuse_color=(0.5, 0.5, 0.5),
             ),
             collision_props=sim_utils.CollisionPropertiesCfg(),
         ),
         init_state=AssetBaseCfg.InitialStateCfg(
-            pos=(0.8, 0.0, 0.25),  # 로봇 앞(x=0.8)에 배치 (높이는 0.5의 절반인 0.25)
+            pos=(0.5, 0.0, 0.25),  # 로봇 앞(x=0.8)에 배치 (높이는 0.5의 절반인 0.25)
         ),
     )
 
@@ -134,7 +176,7 @@ class G1PickPlaceSceneCfg(InteractiveSceneCfg):
                 dynamic_friction=1.0
             ),
         ),
-        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.5, 0.0, 0.55)),
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.3, 0.2, 0.63)),
     )
 
     # (6) 목표 지점
@@ -142,25 +184,19 @@ class G1PickPlaceSceneCfg(InteractiveSceneCfg):
         prim_path="{ENV_REGEX_NS}/Goal",
         spawn=sim_utils.SphereCfg(
             radius=0.05,
-            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 1.0, 0.0), opacity=0.3),
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 1.0, 0.0), opacity=0.8),
             # [중요] 물리 속성을 부여해야 .data를 쓸 수 있습니다.
             # kinematic_enabled=True로 설정해서 중력을 무시하고 고정시킵니다.
             rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True, disable_gravity=True),
             # 충돌 속성(collision_props)은 넣지 않습니다. (로봇이 목표물을 뚫고 지나가야 하므로)
         ),
-        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.8, 0.25, 0.55)),
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.3, 0, 0.63)),
     )
 
 # ------------------------------------------------------------------------------
 # 2. 행동(Actions) 정의 - 로봇을 어떻게 움직일 것인가?
 # ------------------------------------------------------------------------------
-# ['pelvis', 'left_hip_pitch_link', 'pelvis_contour_link', 'right_hip_pitch_link', 'torso_link', 'left_hip_roll_link', 'right_hip_roll_link', 
-# 'head_link', 'imu_link', 'left_shoulder_pitch_link', 'logo_link', 'right_shoulder_pitch_link', 'left_hip_yaw_link', 'right_hip_yaw_link', 
-# 'left_shoulder_roll_link', 'right_shoulder_roll_link', 'left_knee_link', 'right_knee_link', 'left_shoulder_yaw_link', 'right_shoulder_yaw_link', 
-# 'left_ankle_pitch_link', 'right_ankle_pitch_link', 'left_elbow_pitch_link', 'right_elbow_pitch_link', 'left_ankle_roll_link', 'right_ankle_roll_link', 
-# 'left_elbow_roll_link', 'right_elbow_roll_link', 'left_palm_link', 'right_palm_link', 'left_five_link', 'left_three_link', 'left_zero_link', 
-# 'right_five_link', 'right_three_link', 'right_zero_link', 'left_six_link', 'left_four_link', 'left_one_link', 'right_six_link', 'right_four_link', 'right_one_link', 
-# 'left_two_link', 'right_two_link']
+# ['left_hip_pitch_joint', 'right_hip_pitch_joint', 'torso_joint', 'left_hip_roll_joint', 'right_hip_roll_joint', 'left_shoulder_pitch_joint', 'right_shoulder_pitch_joint', 'left_hip_yaw_joint', 'right_hip_yaw_joint', 'left_shoulder_roll_joint', 'right_shoulder_roll_joint', 'left_knee_joint', 'right_knee_joint', 'left_shoulder_yaw_joint', 'right_shoulder_yaw_joint', 'left_ankle_pitch_joint', 'right_ankle_pitch_joint', 'left_elbow_pitch_joint', 'right_elbow_pitch_joint', 'left_ankle_roll_joint', 'right_ankle_roll_joint', 'left_elbow_roll_joint', 'right_elbow_roll_joint', 'left_five_joint', 'left_three_joint', 'left_zero_joint', 'right_five_joint', 'right_three_joint', 'right_zero_joint', 'left_six_joint', 'left_four_joint', 'left_one_joint', 'right_six_joint', 'right_four_joint', 'right_one_joint', 'left_two_joint', 'right_two_joint']
 @configclass
 class ActionCfg:
     # [설명]
@@ -168,16 +204,14 @@ class ActionCfg:
     # 2. left_shoulder/elbow: 팔을 목표 위치로 이동시킴
     # 3. left_zero~six: 손가락을 움직여 물체를 잡음
 
-    joint_names = [
-        "torso_link",
-        ".*left_shoulder.*",
-        ".*left_elbow.*",
-        "left_palm_link",
-        "left_.*(zero|one|two|three|four|five|six)_link"
-    ]
     joint_pos = mdp.JointPositionActionCfg(
         asset_name = "robot",
-        joint_names = joint_names,
+        joint_names = [
+            "torso_joint",
+            ".*left_shoulder.*",
+            ".*left_elbow.*",
+            ".*left_.*(zero|one|two|three|four|five|six)_joint"
+        ],
         scale = 0.5,
         use_default_offset = True,
     )
@@ -223,13 +257,26 @@ class G1PickPlaceEnvCfg(ManagerBasedRLEnvCfg):
     # 보상 설정
     @configclass
     class RewardsCfg:
-        reaching = RewardTermCfg(
-            func=reward_hand_reach_object,
+        pick_place = RewardTermCfg(
+            func=reward_pick_and_place,
             weight=1.0,
             params={
                 "robot_cfg": SceneEntityCfg("robot"),
                 "object_cfg": SceneEntityCfg("object"),
+                "goal_cfg": SceneEntityCfg("goal_maker"),
                 "hand_body_name": "left_palm_link"
+            }
+        )
+
+        # [추가] 물체를 떨어뜨리거나 너무 멀리 날리면 벌점
+        object_far = RewardTermCfg(
+            func=reward_object_out_of_bounds,
+            weight=-1.0, # 벌점 (1.0 * -1.0 = -1점)
+            params={
+                "object_cfg": SceneEntityCfg("object"),
+                "x_limits": [0.0, 1.0],     # 책상 앞뒤 범위
+                "y_limits": [-0.5, 0.5],    # 책상 좌우 범위
+                "z_limits": [0.0, 1.5]      # 높이 범위
             }
         )
        
